@@ -3,12 +3,17 @@
 from pathlib import Path
 import json
 import time
-
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
-
+import numpy as np
+from scipy.stats import pearsonr, shapiro
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import (
+    variance_inflation_factor
+)
+from statsmodels.stats.diagnostic import het_breuschpagan
 
 BASE = Path(__file__).resolve().parents[1]
 RAW = BASE / "data" / "raw"
@@ -33,32 +38,64 @@ START_DATE = pd.Timestamp("2016-01-01", tz="UTC")
 END_DATE = pd.Timestamp("2022-01-01", tz="UTC")
 
 
-def fetch_layer(url, name, where="1=1"):
-    """Fetch every feature from an ArcGIS layer using result pagination."""
+def fetch_layer(url, name, where="1=1", fields=None):
+    """Fetch ArcGIS features in batches using selected fields."""
+    metadata_response = requests.get(
+        url, params={"f": "pjson"}, timeout=30
+    )
+    metadata_response.raise_for_status()
+    metadata = metadata_response.json()
+
+    if fields is None:
+        out_fields = "*"
+    else:
+        available = {
+            field["name"].upper(): field["name"]
+            for field in metadata.get("fields", [])
+        }
+        selected = [
+            available[field.upper()]
+            for field in fields
+            if field.upper() in available
+        ]
+        if not selected:
+            raise ValueError("None of the requested fields exist.")
+        out_fields = ",".join(selected)
+
     features = []
     offset = 0
     page_size = 2000
+
+    print("Downloading", name, "...")
+
     while True:
         params = {
             "where": where,
-            "outFields": "*",
+            "outFields": out_fields,
             "returnGeometry": "true",
             "outSR": "4326",
             "f": "geojson",
             "resultOffset": offset,
             "resultRecordCount": page_size,
         }
+
         response = requests.get(
             url + "/query", params=params, timeout=120
         )
         response.raise_for_status()
         payload = response.json()
+
         if "error" in payload:
             raise RuntimeError(payload["error"])
+
         page = payload.get("features", [])
         features.extend(page)
+
+        print(name, "records downloaded:", len(features))
+
         if len(page) < page_size:
             break
+
         offset += page_size
         time.sleep(0.15)
 
@@ -70,8 +107,8 @@ def fetch_layer(url, name, where="1=1"):
         "type": "FeatureCollection",
         "features": features
     }))
-    return gpd.read_file(path)
 
+    return gpd.read_file(path)
 
 def to_datetime(series):
     """Convert ArcGIS dates or datetime values to UTC datetimes."""
@@ -187,6 +224,235 @@ def save_bar(counts, title, xlabel, filename):
     fig.savefig(FIGURES / filename, dpi=160)
     plt.close(fig)
 
+def add_housing_density(unit_table, canopy_analysis):
+    """Calculate management-unit area and housing density."""
+    area_sq_miles = (
+        canopy_analysis[["unit_id", "geometry"]]
+        .to_crs(epsg=32610)
+        .assign(
+            area_sq_miles=lambda frame: (
+                frame.geometry.area / 2589988.110336
+            )
+        )
+        .set_index("unit_id")["area_sq_miles"]
+    )
+
+    result = unit_table.join(area_sq_miles.rename("area_sq_miles"))
+    result["net_units_per_sq_mile"] = (
+        result["net_housing_units"] / result["area_sq_miles"]
+    )
+
+    return result
+
+def run_statistical_analysis(unit_table):
+    """Analyze housing density and relative canopy change."""
+    data = unit_table[
+        [
+            "net_units_per_sq_mile",
+            "canopy_relative_change",
+            "canopy_2016_percent",
+        ]
+    ].dropna()
+
+    x = data["net_units_per_sq_mile"].to_numpy()
+    y = data["canopy_relative_change"].to_numpy()
+
+    # Observed Pearson correlation.
+    observed_r = pearsonr(x, y).statistic
+
+    # Two-sided permutation test.
+    rng = np.random.default_rng(42)
+    permutations = 10000
+    permuted_correlations = []
+
+    for _ in range(permutations):
+        shuffled_y = rng.permutation(y)
+        permuted_correlations.append(
+            pearsonr(x, shuffled_y).statistic
+        )
+
+    permutation_p = (
+        np.sum(np.abs(permuted_correlations) >= abs(observed_r)) + 1
+    ) / (permutations + 1)
+
+    # Multiple linear regression with HC3 robust standard errors.
+    predictors = data[
+        ["net_units_per_sq_mile", "canopy_2016_percent"]
+    ]
+    predictors = sm.add_constant(predictors)
+    model = sm.OLS(y, predictors).fit(cov_type="HC3")
+
+    # Identify management units with the largest residuals.
+    residual_check = data.copy()
+    residual_check["residual"] = model.resid
+    residual_check["absolute_residual"] = (
+        residual_check["residual"].abs()
+    )
+
+    print("\nManagement units with largest residuals:")
+    print(
+        residual_check.nlargest(5, "absolute_residual")[
+            ["residual", "absolute_residual"]
+        ]
+    )
+    # Check correlation between the regression predictors.
+    predictor_correlation = data[
+        ["net_units_per_sq_mile", "canopy_2016_percent"]
+    ].corr().iloc[0, 1]
+
+    # Calculate variance inflation factors.
+    vif_values = [
+        variance_inflation_factor(predictors.to_numpy(), index)
+        for index in range(1, predictors.shape[1])
+    ]
+
+    # Check residual normality.
+    residuals = model.resid
+    shapiro_stat, shapiro_p = shapiro(residuals)
+
+    # Check for heteroskedasticity.
+    bp_test = het_breuschpagan(
+        residuals, model.model.exog
+    )
+    bp_p = bp_test[1]
+
+    # Plot residuals against fitted values.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(model.fittedvalues, residuals)
+    ax.axhline(0, linestyle="--", color="black")
+    ax.set_title("Regression Residuals vs. Fitted Values")
+    ax.set_xlabel("Fitted relative canopy change")
+    ax.set_ylabel("Residuals")
+    fig.tight_layout()
+    fig.savefig(
+        FIGURES / "regression_residuals.png", dpi=160
+    )
+    plt.close(fig)
+
+    # Create a Q-Q plot of regression residuals.
+    fig = sm.qqplot(residuals, line="45", fit=True)
+    fig.suptitle("Q-Q Plot of Regression Residuals")
+    fig.tight_layout()
+    fig.savefig(
+        FIGURES / "regression_qq_plot.png", dpi=160
+    )
+    plt.close(fig)
+    # Bootstrap confidence interval for the housing-density coefficient.
+    bootstrap_coefficients = []
+
+    for _ in range(5000):
+        sample_indices = rng.integers(0, len(data), len(data))
+        sample = data.iloc[sample_indices]
+
+        sample_x = sm.add_constant(
+            sample[
+                ["net_units_per_sq_mile", "canopy_2016_percent"]
+            ]
+        )
+
+        try:
+            bootstrap_model = sm.OLS(
+                sample["canopy_relative_change"], sample_x
+            ).fit()
+            bootstrap_coefficients.append(
+                bootstrap_model.params["net_units_per_sq_mile"]
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+    bootstrap_ci = np.percentile(
+        bootstrap_coefficients, [2.5, 97.5]
+    )
+
+    # Leave-one-out sensitivity analysis.
+    loo_coefficients = []
+
+    for index in data.index:
+        reduced_data = data.drop(index)
+        reduced_x = sm.add_constant(
+            reduced_data[
+                ["net_units_per_sq_mile", "canopy_2016_percent"]
+            ]
+        )
+        reduced_model = sm.OLS(
+            reduced_data["canopy_relative_change"], reduced_x
+        ).fit()
+
+        loo_coefficients.append(
+            reduced_model.params["net_units_per_sq_mile"]
+        )
+
+    results = [
+                {
+            "analysis": "Predictor correlation",
+            "statistic": predictor_correlation,
+            "p_value": None,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Housing density VIF",
+            "statistic": vif_values[0],
+            "p_value": None,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Residual Shapiro-Wilk test",
+            "statistic": shapiro_stat,
+            "p_value": shapiro_p,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Breusch-Pagan heteroskedasticity test",
+            "statistic": bp_test[0],
+            "p_value": bp_p,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Pearson correlation",
+            "statistic": observed_r,
+            "p_value": pearsonr(x, y).pvalue,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Permutation test",
+            "statistic": observed_r,
+            "p_value": permutation_p,
+            "lower_ci": None,
+            "upper_ci": None,
+        },
+        {
+            "analysis": "Regression: housing density",
+            "statistic": model.params["net_units_per_sq_mile"],
+            "p_value": model.pvalues["net_units_per_sq_mile"],
+            "lower_ci": model.conf_int().loc[
+                "net_units_per_sq_mile", 0
+            ],
+            "upper_ci": model.conf_int().loc[
+                "net_units_per_sq_mile", 1
+            ],
+        },
+        {
+            "analysis": "Bootstrap housing-density coefficient",
+            "statistic": np.mean(bootstrap_coefficients),
+            "p_value": None,
+            "lower_ci": bootstrap_ci[0],
+            "upper_ci": bootstrap_ci[1],
+        },
+        {
+            "analysis": "Leave-one-out housing coefficient range",
+            "statistic": np.mean(loo_coefficients),
+            "p_value": None,
+            "lower_ci": min(loo_coefficients),
+            "upper_ci": max(loo_coefficients),
+        },
+    ]
+
+    return pd.DataFrame(results), model
 
 def main():
     """Run the complete EDA pipeline."""
@@ -195,8 +461,25 @@ def main():
     FIGURES.mkdir(parents=True, exist_ok=True)
     log = []
 
-    permits = fetch_layer(PERMITS_URL, "permits")
-    trees = fetch_layer(TREES_URL, "trees")
+    permits = fetch_layer(
+        PERMITS_URL,
+        "permits",
+        fields=[
+            "ISS_DATE", "APP_DATE", "NET_UNITS",
+            "STGLSTTITL", "DWELTYPE"
+        ]
+    )
+
+    trees = fetch_layer(
+        TREES_URL,
+        "trees",
+        fields=[
+            "OWNERSHIP", "PLANTED_DATE", "DIAM",
+            "CONDITION", "BOTANICAL_NAME",
+            "EXPEDITE", "REMOVED_DATE", "REMOVAL_DATE"
+        ]
+    )
+
     canopy = fetch_layer(CANOPY_URL, "canopy_units")
 
     log.append("Downloaded permits, SDOT trees, and canopy management units.")
@@ -272,8 +555,7 @@ def main():
     )
     planted_totals.name = "trees_planted_2016_2021"
 
-    # Build a management-unit table. Rates are not computed until a verified
-    # historical denominator is available.
+    # Build a management-unit table.
     unit_table = canopy_analysis.drop(columns="geometry").copy()
     unit_table = unit_table.set_index("unit_id")
     unit_table = unit_table.join(permit_totals).join(planted_totals)
@@ -281,9 +563,23 @@ def main():
         "net_housing_units": 0,
         "trees_planted_2016_2021": 0,
     })
-    unit_table["net_units_per_sq_mile"] = None
+
+    # Calculate management-unit area and housing density.
+    unit_table = add_housing_density(unit_table, canopy_analysis)
+
     unit_table = unit_table.reset_index()
     unit_table.to_csv(OUT / "management_unit_eda.csv", index=False)
+
+    statistical_results, regression_model = (
+        run_statistical_analysis(unit_table)
+    )
+    statistical_results.to_csv(
+        OUT / "statistical_results.csv", index=False
+    )
+
+    (OUT / "regression_summary.txt").write_text(
+        regression_model.summary().as_text()
+    )
 
     # Required dataset-level profiles and summaries.
     profile_rows = []
@@ -346,17 +642,18 @@ def main():
         "canopy_change_histogram.png"
     )
 
-    # Joined-dataset visualizations.
+    # Joined-dataset visualization: housing density and canopy change.
     joined = unit_table.dropna(
-        subset=["canopy_relative_change", "net_housing_units"]
+        subset=["canopy_relative_change", "net_units_per_sq_mile"]
     )
+
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.scatter(
-        joined["net_housing_units"],
+        joined["net_units_per_sq_mile"],
         joined["canopy_relative_change"]
     )
-    ax.set_title("Housing growth and relative canopy change by unit")
-    ax.set_xlabel("Net housing units (2016-2021)")
+    ax.set_title("Housing density and relative canopy change by unit")
+    ax.set_xlabel("Net housing units per square mile (2016-2021)")
     ax.set_ylabel("Relative canopy change (%)")
     fig.tight_layout()
     fig.savefig(FIGURES / "housing_vs_canopy_change.png", dpi=160)

@@ -1,0 +1,4 @@
+Downloaded permits, SDOT trees, and canopy management units.
+The source layers are current public ArcGIS layers; the script filters date-based records to 2016-2021.
+STOP: no verified tree-removal date field was found. The published schema contains EXPDATE (Expiration Date), which is not treated as a removal date. Question 4 and removal-rate analyses are pending data-dictionary verification.
+No historical 2016 tree inventory denominator was reconstructed. Do not calculate removal rates per 1,000 baseline trees until historical inventory completeness is verified.
