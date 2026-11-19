@@ -588,7 +588,8 @@ def main():
     ))
     summary_rows.extend(summarize_variables(
         "sdot_trees_current_snapshot", trees,
-        [planted_field, "OWNERSHIP", "CONDITION", "BOTANICAL_NAME"]
+        [planted_field, "DIAM", "OWNERSHIP", "CONDITION",
+        "BOTANICAL_NAME"]
     ))
     summary_rows.extend(summarize_variables(
         "canopy_management_units", canopy,
