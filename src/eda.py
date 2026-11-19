@@ -257,10 +257,8 @@ def run_statistical_analysis(unit_table):
     x = data["net_units_per_sq_mile"].to_numpy()
     y = data["canopy_relative_change"].to_numpy()
 
-    # Observed Pearson correlation.
     observed_r = pearsonr(x, y).statistic
 
-    # Two-sided permutation test.
     rng = np.random.default_rng(42)
     permutations = 10000
     permuted_correlations = []
@@ -275,14 +273,12 @@ def run_statistical_analysis(unit_table):
         np.sum(np.abs(permuted_correlations) >= abs(observed_r)) + 1
     ) / (permutations + 1)
 
-    # Multiple linear regression with HC3 robust standard errors.
     predictors = data[
         ["net_units_per_sq_mile", "canopy_2016_percent"]
     ]
     predictors = sm.add_constant(predictors)
     model = sm.OLS(y, predictors).fit(cov_type="HC3")
 
-    # Identify management units with the largest residuals.
     residual_check = data.copy()
     residual_check["residual"] = model.resid
     residual_check["absolute_residual"] = (
@@ -295,22 +291,18 @@ def run_statistical_analysis(unit_table):
             ["residual", "absolute_residual"]
         ]
     )
-    # Check correlation between the regression predictors.
     predictor_correlation = data[
         ["net_units_per_sq_mile", "canopy_2016_percent"]
     ].corr().iloc[0, 1]
 
-    # Calculate variance inflation factors.
     vif_values = [
         variance_inflation_factor(predictors.to_numpy(), index)
         for index in range(1, predictors.shape[1])
     ]
 
-    # Check residual normality.
     residuals = model.resid
     shapiro_stat, shapiro_p = shapiro(residuals)
 
-    # Check for heteroskedasticity.
     bp_test = het_breuschpagan(
         residuals, model.model.exog
     )
@@ -364,7 +356,6 @@ def run_statistical_analysis(unit_table):
         bootstrap_coefficients, [2.5, 97.5]
     )
 
-    # Leave-one-out sensitivity analysis.
     loo_coefficients = []
 
     for index in data.index:
@@ -488,7 +479,6 @@ def main():
         "filters date-based records to 2016-2021."
     )
 
-    # Canopy layer 13 contains the 2016 baseline and canopy-change fields.
     unit_id = first_existing(
         canopy.columns, ["TC_ID", "MANAGEMENT_UNITS", "OBJECTID"]
     )
@@ -516,7 +506,6 @@ def main():
         canopy_change: "canopy_relative_change",
     })
 
-    # Filter permit records using the issued date, as specified in the proposal.
     permit_date = first_existing(
         permits.columns, ["ISS_DATE", "APP_DATE"]
     )
@@ -537,7 +526,6 @@ def main():
     permit_totals = permit_join.groupby("unit_id")[net_field].sum()
     permit_totals.name = "net_housing_units"
 
-    # Retain only SDOT-maintained trees and count planting dates in 2016-2021.
     if "OWNERSHIP" in trees.columns:
         trees = trees[trees["OWNERSHIP"].astype(str).str.upper() == "SDOT"]
     planted_field = first_existing(trees.columns, ["PLANTED_DATE"])
@@ -555,7 +543,6 @@ def main():
     )
     planted_totals.name = "trees_planted_2016_2021"
 
-    # Build a management-unit table.
     unit_table = canopy_analysis.drop(columns="geometry").copy()
     unit_table = unit_table.set_index("unit_id")
     unit_table = unit_table.join(permit_totals).join(planted_totals)
@@ -581,7 +568,6 @@ def main():
         regression_model.summary().as_text()
     )
 
-    # Required dataset-level profiles and summaries.
     profile_rows = []
     summary_rows = []
     datasets = {
@@ -602,7 +588,8 @@ def main():
     ))
     summary_rows.extend(summarize_variables(
         "sdot_trees_current_snapshot", trees,
-        [planted_field, "OWNERSHIP", "CONDITION", "BOTANICAL_NAME"]
+        [planted_field, "DIAM", "OWNERSHIP", "CONDITION",
+        "BOTANICAL_NAME"]
     ))
     summary_rows.extend(summarize_variables(
         "canopy_management_units", canopy,
@@ -612,7 +599,7 @@ def main():
         OUT / "variable_summaries.csv", index=False
     )
 
-    # At least two visualizations for each original dataset.
+    # two visualizations for each original dataset.
     save_histogram(
         permits, net_field, "Net housing units per permit record",
         "permits_net_units_histogram.png"
