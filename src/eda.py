@@ -1,19 +1,22 @@
+
 """Download Seattle datasets and produce reproducible CSE 163 EDA outputs."""
 
 from pathlib import Path
+from typing import Any, Optional
 import json
 import time
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import requests
-import numpy as np
-from scipy.stats import pearsonr, shapiro
 import statsmodels.api as sm
+from scipy.stats import pearsonr, shapiro
+from statsmodels.stats.diagnostic import het_breuschpagan
 from statsmodels.stats.outliers_influence import (
     variance_inflation_factor
 )
-from statsmodels.stats.diagnostic import het_breuschpagan
 
 BASE = Path(__file__).resolve().parents[1]
 RAW = BASE / "data" / "raw"
@@ -38,7 +41,12 @@ START_DATE = pd.Timestamp("2016-01-01", tz="UTC")
 END_DATE = pd.Timestamp("2022-01-01", tz="UTC")
 
 
-def fetch_layer(url, name, where="1=1", fields=None):
+def fetch_layer(
+    url: str,
+    name: str,
+    where: str = "1=1",
+    fields: Optional[list[str]] = None
+) -> gpd.GeoDataFrame:
     """Fetch ArcGIS features in batches using selected fields."""
     metadata_response = requests.get(
         url, params={"f": "pjson"}, timeout=30
@@ -110,25 +118,31 @@ def fetch_layer(url, name, where="1=1", fields=None):
 
     return gpd.read_file(path)
 
-def to_datetime(series):
+
+def to_datetime(series: pd.Series) -> pd.Series:
     """Convert ArcGIS dates or datetime values to UTC datetimes."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce", utc=True)
+
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.notna().any():
         return pd.to_datetime(
             numeric, unit="ms", errors="coerce", utc=True
         )
+
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 
-def date_mask(series):
+def date_mask(series: pd.Series) -> pd.Series:
     """Return a mask for dates in 2016 through 2021, inclusive."""
     dates = to_datetime(series)
     return dates.ge(START_DATE) & dates.lt(END_DATE)
 
 
-def first_existing(columns, choices):
+def first_existing(
+    columns: pd.Index,
+    choices: list[str]
+) -> Optional[str]:
     """Return the first candidate column present in a dataframe."""
     for choice in choices:
         if choice in columns:
@@ -136,7 +150,10 @@ def first_existing(columns, choices):
     return None
 
 
-def profile_dataset(name, frame):
+def profile_dataset(
+    name: str,
+    frame: pd.DataFrame
+) -> list[dict[str, Any]]:
     """Record dimensions and missingness for one dataset."""
     rows = []
     for column in frame.columns:
@@ -154,12 +171,17 @@ def profile_dataset(name, frame):
     return rows
 
 
-def summarize_variables(name, frame, columns):
+def summarize_variables(
+    name: str,
+    frame: pd.DataFrame,
+    columns: list[str]
+) -> list[dict[str, Any]]:
     """Create seven-number summaries and categorical counts."""
     rows = []
     for column in columns:
         if column not in frame.columns:
             continue
+
         series = frame[column].dropna()
         if pd.api.types.is_numeric_dtype(series):
             stats = series.describe()
@@ -199,9 +221,16 @@ def summarize_variables(name, frame, columns):
     return rows
 
 
-def save_histogram(frame, column, title, filename):
+def save_histogram(
+    frame: pd.DataFrame,
+    column: str,
+    title: str,
+    filename: str
+) -> None:
     """Save a histogram for a numeric variable."""
-    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    values = pd.to_numeric(
+        frame[column], errors="coerce"
+    ).dropna()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(values, bins=20, edgecolor="black")
     ax.set_title(title)
@@ -212,7 +241,12 @@ def save_histogram(frame, column, title, filename):
     plt.close(fig)
 
 
-def save_bar(counts, title, xlabel, filename):
+def save_bar(
+    counts: pd.Series,
+    title: str,
+    xlabel: str,
+    filename: str
+) -> None:
     """Save a bar chart from a value-count series."""
     fig, ax = plt.subplots(figsize=(9, 5))
     counts.plot(kind="bar", ax=ax)
@@ -224,7 +258,11 @@ def save_bar(counts, title, xlabel, filename):
     fig.savefig(FIGURES / filename, dpi=160)
     plt.close(fig)
 
-def add_housing_density(unit_table, canopy_analysis):
+
+def add_housing_density(
+    unit_table: pd.DataFrame,
+    canopy_analysis: gpd.GeoDataFrame
+) -> pd.DataFrame:
     """Calculate management-unit area and housing density."""
     area_sq_miles = (
         canopy_analysis[["unit_id", "geometry"]]
@@ -237,14 +275,19 @@ def add_housing_density(unit_table, canopy_analysis):
         .set_index("unit_id")["area_sq_miles"]
     )
 
-    result = unit_table.join(area_sq_miles.rename("area_sq_miles"))
+    result = unit_table.join(
+        area_sq_miles.rename("area_sq_miles")
+    )
     result["net_units_per_sq_mile"] = (
         result["net_housing_units"] / result["area_sq_miles"]
     )
 
     return result
 
-def run_statistical_analysis(unit_table):
+
+def run_statistical_analysis(
+    unit_table: pd.DataFrame
+) -> tuple[pd.DataFrame, Any]:
     """Analyze housing density and relative canopy change."""
     data = unit_table[
         [
@@ -291,6 +334,7 @@ def run_statistical_analysis(unit_table):
             ["residual", "absolute_residual"]
         ]
     )
+
     predictor_correlation = data[
         ["net_units_per_sq_mile", "canopy_2016_percent"]
     ].corr().iloc[0, 1]
@@ -329,6 +373,7 @@ def run_statistical_analysis(unit_table):
         FIGURES / "regression_qq_plot.png", dpi=160
     )
     plt.close(fig)
+
     # Bootstrap confidence interval for the housing-density coefficient.
     bootstrap_coefficients = []
 
@@ -374,7 +419,7 @@ def run_statistical_analysis(unit_table):
         )
 
     results = [
-                {
+        {
             "analysis": "Predictor correlation",
             "statistic": predictor_correlation,
             "p_value": None,
@@ -445,7 +490,8 @@ def run_statistical_analysis(unit_table):
 
     return pd.DataFrame(results), model
 
-def main():
+
+def main() -> None:
     """Run the complete EDA pipeline."""
     RAW.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -473,7 +519,9 @@ def main():
 
     canopy = fetch_layer(CANOPY_URL, "canopy_units")
 
-    log.append("Downloaded permits, SDOT trees, and canopy management units.")
+    log.append(
+        "Downloaded permits, SDOT trees, and canopy management units."
+    )
     log.append(
         "The source layers are current public ArcGIS layers; the script "
         "filters date-based records to 2016-2021."
@@ -490,6 +538,7 @@ def main():
         canopy.columns,
         ["Change_PercentChange", "TC_R_PC", "RELATIVE_PERCENT_CHANGE"]
     )
+
     if unit_id is None or canopy_2016 is None or canopy_change is None:
         raise ValueError(
             "Could not identify canopy ID, 2016 canopy, and change fields. "
@@ -511,30 +560,45 @@ def main():
     )
     if permit_date is None:
         raise ValueError("No permit date field found.")
+
     permits = permits[date_mask(permits[permit_date])].copy()
     net_field = first_existing(permits.columns, ["NET_UNITS"])
+
     if net_field is None:
         raise ValueError("NET_UNITS field was not found in permit data.")
+
     permits[net_field] = pd.to_numeric(
         permits[net_field], errors="coerce"
     )
     permits = permits.dropna(subset=[net_field, "geometry"])
+
     permit_join = gpd.sjoin(
-        permits, canopy_analysis[["unit_id", "geometry"]],
-        how="left", predicate="within"
+        permits,
+        canopy_analysis[["unit_id", "geometry"]],
+        how="left",
+        predicate="within"
     )
     permit_totals = permit_join.groupby("unit_id")[net_field].sum()
     permit_totals.name = "net_housing_units"
 
     if "OWNERSHIP" in trees.columns:
-        trees = trees[trees["OWNERSHIP"].astype(str).str.upper() == "SDOT"]
-    planted_field = first_existing(trees.columns, ["PLANTED_DATE"])
+        trees = trees[
+            trees["OWNERSHIP"].astype(str).str.upper() == "SDOT"
+        ]
+
+    planted_field = first_existing(
+        trees.columns, ["PLANTED_DATE"]
+    )
     if planted_field is None:
         raise ValueError("PLANTED_DATE field was not found in tree data.")
+
     trees["planted_in_period"] = date_mask(trees[planted_field])
+
     tree_join = gpd.sjoin(
-        trees, canopy_analysis[["unit_id", "geometry"]],
-        how="left", predicate="within"
+        trees,
+        canopy_analysis[["unit_id", "geometry"]],
+        how="left",
+        predicate="within"
     )
     planted_totals = (
         tree_join[tree_join["planted_in_period"]]
@@ -552,10 +616,14 @@ def main():
     })
 
     # Calculate management-unit area and housing density.
-    unit_table = add_housing_density(unit_table, canopy_analysis)
+    unit_table = add_housing_density(
+        unit_table, canopy_analysis
+    )
 
     unit_table = unit_table.reset_index()
-    unit_table.to_csv(OUT / "management_unit_eda.csv", index=False)
+    unit_table.to_csv(
+        OUT / "management_unit_eda.csv", index=False
+    )
 
     statistical_results, regression_model = (
         run_statistical_analysis(unit_table)
@@ -570,6 +638,7 @@ def main():
 
     profile_rows = []
     summary_rows = []
+
     datasets = {
         "permits_2016_2021": permits,
         "sdot_trees_current_snapshot": trees,
@@ -577,61 +646,88 @@ def main():
         "permits_joined_to_canopy": permit_join,
         "trees_joined_to_canopy": tree_join,
     }
+
     for name, frame in datasets.items():
         profile_rows.extend(profile_dataset(name, frame))
+
     profile_frame = pd.DataFrame(profile_rows)
-    profile_frame.to_csv(OUT / "dataset_profiles.csv", index=False)
+    profile_frame.to_csv(
+        OUT / "dataset_profiles.csv", index=False
+    )
 
     summary_rows.extend(summarize_variables(
-        "permits_2016_2021", permits,
+        "permits_2016_2021",
+        permits,
         [net_field, permit_date, "STGLSTTITL", "DWELTYPE"]
     ))
     summary_rows.extend(summarize_variables(
-        "sdot_trees_current_snapshot", trees,
-        [planted_field, "DIAM", "OWNERSHIP", "CONDITION",
-        "BOTANICAL_NAME"]
+        "sdot_trees_current_snapshot",
+        trees,
+        [
+            planted_field, "DIAM", "OWNERSHIP",
+            "CONDITION", "BOTANICAL_NAME"
+        ]
     ))
     summary_rows.extend(summarize_variables(
-        "canopy_management_units", canopy,
+        "canopy_management_units",
+        canopy,
         [canopy_2016, canopy_change, unit_id]
     ))
+
     pd.DataFrame(summary_rows).to_csv(
         OUT / "variable_summaries.csv", index=False
     )
 
-    # two visualizations for each original dataset.
+    # Two visualizations for each original dataset.
     save_histogram(
-        permits, net_field, "Net housing units per permit record",
+        permits,
+        net_field,
+        "Net housing units per permit record",
         "permits_net_units_histogram.png"
     )
+
     if "STGLSTTITL" in permits.columns:
         save_bar(
             permits["STGLSTTITL"].value_counts(),
-            "Permit records by stage", "Permit stage",
+            "Permit records by stage",
+            "Permit stage",
             "permits_by_stage.png"
         )
+
     save_histogram(
-        trees, "DIAM", "Street tree diameter distribution",
+        trees,
+        "DIAM",
+        "Street tree diameter distribution",
         "trees_diameter_histogram.png"
     )
+
     if "CONDITION" in trees.columns:
         save_bar(
             trees["CONDITION"].value_counts().head(15),
-            "Most common street tree conditions", "Condition",
+            "Most common street tree conditions",
+            "Condition",
             "trees_condition_counts.png"
         )
+
     save_histogram(
-        canopy, canopy_2016, "2016 tree canopy percentage by unit",
+        canopy,
+        canopy_2016,
+        "2016 tree canopy percentage by unit",
         "canopy_2016_histogram.png"
     )
     save_histogram(
-        canopy, canopy_change, "Relative tree canopy change, 2016-2021",
+        canopy,
+        canopy_change,
+        "Relative tree canopy change, 2016-2021",
         "canopy_change_histogram.png"
     )
 
     # Joined-dataset visualization: housing density and canopy change.
     joined = unit_table.dropna(
-        subset=["canopy_relative_change", "net_units_per_sq_mile"]
+        subset=[
+            "canopy_relative_change",
+            "net_units_per_sq_mile"
+        ]
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -643,12 +739,18 @@ def main():
     ax.set_xlabel("Net housing units per square mile (2016-2021)")
     ax.set_ylabel("Relative canopy change (%)")
     fig.tight_layout()
-    fig.savefig(FIGURES / "housing_vs_canopy_change.png", dpi=160)
+    fig.savefig(
+        FIGURES / "housing_vs_canopy_change.png", dpi=160
+    )
     plt.close(fig)
 
     joined_tree = unit_table.dropna(
-        subset=["canopy_relative_change", "trees_planted_2016_2021"]
+        subset=[
+            "canopy_relative_change",
+            "trees_planted_2016_2021"
+        ]
     )
+
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.scatter(
         joined_tree["canopy_relative_change"],
@@ -658,13 +760,16 @@ def main():
     ax.set_xlabel("Relative canopy change (%)")
     ax.set_ylabel("Trees planted (2016-2021)")
     fig.tight_layout()
-    fig.savefig(FIGURES / "planting_vs_canopy_change.png", dpi=160)
+    fig.savefig(
+        FIGURES / "planting_vs_canopy_change.png", dpi=160
+    )
     plt.close(fig)
 
     # Explicitly flag the unresolved removal-field mismatch.
     removal_field = first_existing(
         trees.columns, ["EXPEDITE", "REMOVED_DATE", "REMOVAL_DATE"]
     )
+
     if removal_field is None:
         log.append(
             "STOP: no verified tree-removal date field was found. "
@@ -683,7 +788,10 @@ def main():
         "Do not calculate removal rates per 1,000 baseline trees until "
         "historical inventory completeness is verified."
     )
-    (OUT / "eda_run_log.txt").write_text("\n".join(log) + "\n")
+
+    (OUT / "eda_run_log.txt").write_text(
+        "\n".join(log) + "\n"
+    )
     print("\n".join(log))
     print("EDA outputs saved to:", OUT)
 
